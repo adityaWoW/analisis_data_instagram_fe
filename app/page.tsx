@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import FileSelector from "@/components/FileSelector";
 import ResultCard from "@/components/ResultCard";
 import API from "@/service/api";
@@ -17,6 +17,19 @@ interface ApiResponse<T> {
   data: T;
 }
 
+interface JobStatus {
+  job_id: string;
+  status: "running" | "done" | "error";
+  progress: number;
+  total: number;
+  done: number;
+  batch_done: number;
+  batch_total: number;
+  message: string;
+  result: Record<string, unknown> | null;
+  error: string | null;
+}
+
 export default function HomePage() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
@@ -25,20 +38,63 @@ export default function HomePage() {
   >([]);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
-
-  // STATE: Menyimpan daftar sheets dan sheet yang dipilih
   const [availableSheets, setAvailableSheets] = useState<string[]>([]);
   const [sheetToAnalyze, setSheetToAnalyze] = useState<string>("");
   const [loadingSheets, setLoadingSheets] = useState(false);
+
+  // ─── JOB STATE ────────────────────────────────────────────
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const pollRef = useRef<NodeJS.Timeout | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // Polling status job tiap 5 detik
+  const startPolling = useCallback(
+    (id: string) => {
+      stopPolling();
+      pollRef.current = setInterval(async () => {
+        try {
+          const res = await API.get<JobStatus>(`/analyze/status/${id}`);
+          const status = res.data;
+          setJobStatus(status);
+
+          if (status.status === "done") {
+            stopPolling();
+            setAnalyzing(false);
+            setResult(status.result);
+          } else if (status.status === "error") {
+            stopPolling();
+            setAnalyzing(false);
+            alert(`Analisis gagal: ${status.error || status.message}`);
+          }
+        } catch (err) {
+          console.error("Polling error:", err);
+        }
+      }, 5000);
+    },
+    [stopPolling],
+  );
+
+  // Cleanup polling saat unmount
+  useEffect(() => () => stopPolling(), [stopPolling]);
 
   const resetFileSelection = useCallback(() => {
     setSelectedFile(null);
     setAvailableSheets([]);
     setSheetToAnalyze("");
     setResult(null);
-  }, []);
+    setJobId(null);
+    setJobStatus(null);
+    stopPolling();
+  }, [stopPolling]);
 
-  // AMBIL FILE UTAMA (ROOT)
   const fetchRootFiles = useCallback(async () => {
     try {
       setLoading(true);
@@ -46,15 +102,13 @@ export default function HomePage() {
       setFiles(res.data?.data || []);
       resetFileSelection();
       setFolderStack([]);
-    } catch (error) {
-      console.error("Error fetching root files:", error);
+    } catch {
       alert("Gagal mengambil file utama 😢");
     } finally {
       setLoading(false);
     }
   }, [resetFileSelection]);
 
-  // BUKA FOLDER
   const openFolder = useCallback(
     async (folder: FileItem) => {
       try {
@@ -68,11 +122,8 @@ export default function HomePage() {
           { id: folder.id, name: folder.name },
         ]);
         resetFileSelection();
-      } catch (error) {
-        console.error("Error opening folder:", error);
-        alert(
-          "Gagal membuka folder. Pastikan Service Account memiliki akses ke folder ini 😢",
-        );
+      } catch {
+        alert("Gagal membuka folder 😢");
       } finally {
         setLoading(false);
       }
@@ -80,41 +131,30 @@ export default function HomePage() {
     [resetFileSelection],
   );
 
-  // AMBIL DAFTAR SHEETS DARI SPREADSHEET
   const fetchSpreadsheetSheets = async (fileId: string) => {
     try {
       setLoadingSheets(true);
       setAvailableSheets([]);
       setSheetToAnalyze("");
-
       const res = await API.get<ApiResponse<string[]>>(
         `/files/${fileId}/sheets`,
       );
       const sheetList = res.data?.data || [];
       setAvailableSheets(sheetList);
-
-      if (sheetList.length > 0) {
-        setSheetToAnalyze(sheetList[0]);
-      }
-    } catch (err) {
-      console.error("Error fetching sheets:", err);
-      alert(
-        "Gagal memuat sheet berkas ini.\n\n" +
-          "💡 Solusi: Pastikan berkas ini sudah Anda 'Share/Bagikan' dengan memberikan akses ke email Service Account Anda di Google Drive.",
-      );
+      if (sheetList.length > 0) setSheetToAnalyze(sheetList[0]);
+    } catch {
+      alert("Gagal memuat sheet. Pastikan Service Account memiliki akses 😢");
     } finally {
       setLoadingSheets(false);
     }
   };
 
-  // HANDLE SELEKSI FILE / FOLDER
   const handleSelectFile = async (fileId: string) => {
     if (!fileId) {
       resetFileSelection();
       return;
     }
-
-    const selected = files.find((file) => file.id === fileId);
+    const selected = files.find((f) => f.id === fileId);
     if (!selected) return;
 
     if (
@@ -127,47 +167,28 @@ export default function HomePage() {
 
     setSelectedFile(selected);
     setResult(null);
+    setJobId(null);
+    setJobStatus(null);
 
-    // Filter deteksi multi-sheet yang aman dari inkonsistensi tipe data API
-    const isSpreadsheetFile =
+    const isSheet =
       selected.type === "sheet" ||
-      selected.mimeType === "application/vnd.google-apps.spreadsheet" ||
-      selected.mimeType ===
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
-      selected.mimeType?.toLowerCase().includes("spreadsheet") ||
-      selected.mimeType?.toLowerCase().includes("sheet") ||
+      selected.mimeType?.includes("spreadsheet") ||
+      selected.mimeType?.includes("sheet") ||
       selected.name.endsWith(".xlsx") ||
       selected.name.endsWith(".xls");
 
-    if (isSpreadsheetFile) {
+    if (isSheet) {
       await fetchSpreadsheetSheets(selected.id);
     } else {
-      // Fallback Aman: Coba check langsung jika mimeType tidak terdeteksi teratur oleh backend
       try {
         setLoadingSheets(true);
         const res = await API.get<ApiResponse<string[]>>(
           `/files/${selected.id}/sheets`,
         );
         const sheetList = res.data?.data || [];
-
-        if (sheetList.length > 0) {
-          setAvailableSheets(sheetList);
-          setSheetToAnalyze(sheetList[0]);
-        } else {
-          setAvailableSheets([]);
-          setSheetToAnalyze("");
-        }
-      } catch (err) {
-        const errWithResponse = err as { response?: { data?: unknown } };
-        console.error(
-          "Fallback check failed:",
-          errWithResponse.response?.data || err,
-        );
-
-        alert(
-          "Akses Ditolak (Error 500/403) 😢\n\n" +
-            "Google API tidak dapat membaca berkas ini. Silakan bagikan berkas ini ke email Service Account Anda terlebih dahulu di Google Drive.",
-        );
+        setAvailableSheets(sheetList);
+        if (sheetList.length > 0) setSheetToAnalyze(sheetList[0]);
+      } catch {
         setAvailableSheets([]);
         setSheetToAnalyze("");
       } finally {
@@ -176,13 +197,11 @@ export default function HomePage() {
     }
   };
 
-  // KEMBALI KE FOLDER SEBELUMNYA
   const goBack = useCallback(async () => {
     try {
       setLoading(true);
       const updatedStack = [...folderStack];
       updatedStack.pop();
-
       resetFileSelection();
 
       if (updatedStack.length === 0) {
@@ -192,51 +211,63 @@ export default function HomePage() {
         return;
       }
 
-      const previousFolder = updatedStack[updatedStack.length - 1];
-      const res = await API.get<ApiResponse<FileItem[]>>(
-        `/files/${previousFolder.id}`,
-      );
-
+      const prev = updatedStack[updatedStack.length - 1];
+      const res = await API.get<ApiResponse<FileItem[]>>(`/files/${prev.id}`);
       setFiles(res.data?.data || []);
       setFolderStack(updatedStack);
-    } catch (error) {
-      console.error("Error going back:", error);
+    } catch {
       alert("Gagal kembali ke folder sebelumnya 💔");
     } finally {
       setLoading(false);
     }
   }, [folderStack, resetFileSelection]);
 
-  // ANALYZE FILE
+  // ─── ANALYZE — kirim job, lalu polling ────────────────────
   const analyzeFile = async () => {
     if (!selectedFile) {
-      alert("Silahkan pilih file terlebih dahulu ✨");
+      alert("Pilih file terlebih dahulu ✨");
       return;
     }
-
     if (availableSheets.length > 0 && !sheetToAnalyze) {
-      alert("Silahkan pilih sheet yang ingin dianalisis terlebih dahulu ✨");
+      alert("Pilih sheet terlebih dahulu ✨");
       return;
     }
 
     try {
-      setLoading(true);
-      const res = await API.post<ApiResponse<Record<string, unknown>>>(
+      setAnalyzing(true);
+      setResult(null);
+      setJobStatus(null);
+
+      const res = await API.post<{ success: boolean; job_id: string }>(
         "/analyze",
         {
           file_id: selectedFile.id,
           sheet_name: sheetToAnalyze,
         },
       );
-      console.log("debug", res);
-      setResult(res.data?.data || null);
-    } catch (error) {
-      console.error("Error analyzing file:", error);
-      alert(
-        "Gagal menganalisis sheet yang dipilih. Pastikan Service Account memiliki akses 'Editor/Viewer' di berkas tersebut 😢",
-      );
-    } finally {
-      setLoading(false);
+
+      const id = res.data?.job_id;
+      if (!id) throw new Error("job_id tidak diterima dari server");
+
+      setJobId(id);
+      setJobStatus({
+        job_id: id,
+        status: "running",
+        progress: 0,
+        total: 0,
+        done: 0,
+        batch_done: 0,
+        batch_total: 0,
+        message: "Job dimulai...",
+        result: null,
+        error: null,
+      });
+
+      startPolling(id);
+    } catch (err) {
+      console.error(err);
+      setAnalyzing(false);
+      alert("Gagal memulai analisis 😢");
     }
   };
 
@@ -256,11 +287,12 @@ export default function HomePage() {
     };
   }, [fetchRootFiles]);
 
+  const isRunning = analyzing || jobStatus?.status === "running";
+
   return (
     <main className="min-h-screen bg-[#FDF8F5] p-6 md:p-12 flex items-start justify-center font-sans">
-      {/* UKURAN DIPERBESAR: Mengubah max-w-xl menjadi max-w-4xl agar layout jauh lebih lebar */}
       <div className="w-full max-w-4xl bg-white rounded-2xl shadow-md shadow-rose-100/40 p-6 md:p-10 border border-rose-100/60 transition-all">
-        {/* HEADER (DISEDERHANAKAN AGAR PROPORSIONAL) */}
+        {/* HEADER */}
         <div className="text-center mb-8">
           <span className="text-4xl inline-block mb-2">✨</span>
           <h1 className="text-3xl font-extrabold text-gray-800 tracking-tight md:text-4xl">
@@ -276,7 +308,7 @@ export default function HomePage() {
           <div className="flex flex-wrap gap-2 text-sm text-gray-500 mb-4 items-center">
             <button
               onClick={fetchRootFiles}
-              className="hover:text-rose-500 font-medium transition-colors flex items-center gap-1"
+              className="hover:text-rose-500 font-medium transition-colors"
             >
               🏠 Utama
             </button>
@@ -289,7 +321,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* FILE SELECTOR (UKURAN INPUT MENYESUAIKAN LEBAR BARU) */}
+        {/* FILE SELECTOR */}
         <div className="space-y-3">
           <label className="block text-xs font-bold uppercase tracking-wider text-rose-500">
             Pilih File / Folder
@@ -303,57 +335,53 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* BACK BUTTON */}
         {folderStack.length > 0 && (
           <button
             onClick={goBack}
-            className="mt-3 text-sm text-rose-500 hover:text-rose-600 transition-colors flex items-center gap-1"
+            className="mt-3 text-sm text-rose-500 hover:text-rose-600 transition-colors"
           >
             ← Kembali Folder
           </button>
         )}
 
-        {/* DAFTAR SHEET */}
+        {/* SHEET SELECTOR */}
         {selectedFile && (
-          <div className="mt-6 p-5 rounded-xl bg-rose-50/50 border border-rose-100 space-y-4 animate-fadeIn">
+          <div className="mt-6 p-5 rounded-xl bg-rose-50/50 border border-rose-100 space-y-4">
             <div>
               <p className="text-xs text-gray-400 uppercase font-bold tracking-wider">
                 File Induk:
               </p>
-              <p className="text-lg font-bold text-gray-800 flex items-center gap-1.5 mt-0.5">
+              <p className="text-lg font-bold text-gray-800 mt-0.5">
                 📄 {selectedFile.name}
               </p>
             </div>
 
             {loadingSheets ? (
               <div className="pt-2 border-t border-rose-200/60 flex items-center gap-2 text-sm text-rose-500 font-medium animate-pulse">
-                ⏳ Sedang memuat semua sheet di dalam file...
+                ⏳ Sedang memuat sheet...
               </div>
             ) : (
               availableSheets.length > 0 && (
                 <div className="pt-4 border-t border-rose-200/60 space-y-3">
                   <label className="block text-xs font-bold uppercase tracking-wider text-gray-600">
-                    Silahkan Pilih Sheet yang Akan Di-Analyze 👇
+                    Pilih Sheet 👇
                   </label>
-
-                  {/* UKURAN LAYOUT GRID: Menggunakan 2 kolom di layar medium ke atas agar tidak memanjang ke bawah */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-60 overflow-y-auto pr-1">
                     {availableSheets.map((sheetName) => {
                       const isSelected = sheetToAnalyze === sheetName;
                       return (
                         <button
                           key={sheetName}
-                          type="button"
                           onClick={() => setSheetToAnalyze(sheetName)}
                           className={`w-full text-left px-4 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-between border ${
                             isSelected
-                              ? "bg-rose-500 text-white border-rose-500 shadow-md transform scale-[1.01]"
-                              : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50 hover:border-gray-300"
+                              ? "bg-rose-500 text-white border-rose-500 shadow-md scale-[1.01]"
+                              : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
                           }`}
                         >
                           <span className="truncate">📊 {sheetName}</span>
                           {isSelected && (
-                            <span className="text-xs bg-white text-rose-500 px-2.5 py-1 rounded-full font-bold shadow-sm">
+                            <span className="text-xs bg-white text-rose-500 px-2.5 py-1 rounded-full font-bold">
                               Terpilih
                             </span>
                           )}
@@ -367,26 +395,67 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* ANALYZE BUTTON (UKURAN TOMBOL DIPERBESAR) */}
+        {/* ANALYZE BUTTON */}
         <button
           onClick={analyzeFile}
           disabled={
-            loading ||
+            isRunning ||
             loadingSheets ||
             !selectedFile ||
             (availableSheets.length > 0 && !sheetToAnalyze)
           }
-          className="w-full mt-6 bg-rose-500 hover:bg-rose-600 text-white font-bold py-4 px-6 rounded-xl text-base transition-all duration-200 disabled:opacity-50 disabled:pointer-events-none shadow-md hover:shadow-rose-200 flex items-center justify-center gap-2"
+          className="w-full mt-6 bg-rose-500 hover:bg-rose-600 text-white font-bold py-4 px-6 rounded-xl text-base transition-all disabled:opacity-50 disabled:pointer-events-none shadow-md flex items-center justify-center gap-2"
         >
-          {loading
-            ? "Sedang Menganalisis..."
+          {isRunning
+            ? "⏳ Sedang Menganalisis..."
             : `Analyze Sheet: ${sheetToAnalyze || selectedFile?.name || ""} 🚀`}
         </button>
 
-        {/* RESULT (SEKANG JAUH LEBIH LUAS UNTUK MENAMPILKAN TABEL) */}
+        {/* PROGRESS BAR */}
+        {jobStatus && jobStatus.status === "running" && (
+          <div className="mt-6 p-5 rounded-xl bg-blue-50 border border-blue-100 space-y-3">
+            <div className="flex items-center justify-between text-sm font-semibold text-blue-700">
+              <span>🔄 {jobStatus.message}</span>
+              <span>{jobStatus.progress}%</span>
+            </div>
+
+            {/* Progress bar */}
+            <div className="w-full bg-blue-100 rounded-full h-3 overflow-hidden">
+              <div
+                className="bg-blue-500 h-3 rounded-full transition-all duration-500"
+                style={{ width: `${jobStatus.progress}%` }}
+              />
+            </div>
+
+            {/* Detail batch */}
+            {jobStatus.batch_total > 0 && (
+              <div className="flex justify-between text-xs text-blue-500 font-medium">
+                <span>
+                  Batch {jobStatus.batch_done}/{jobStatus.batch_total}
+                </span>
+                <span>
+                  {jobStatus.done}/{jobStatus.total} URL selesai
+                </span>
+              </div>
+            )}
+
+            <p className="text-xs text-blue-400 text-center">
+              Polling otomatis tiap 5 detik · Jangan tutup halaman ini
+            </p>
+          </div>
+        )}
+
+        {/* ERROR STATE */}
+        {jobStatus?.status === "error" && (
+          <div className="mt-6 p-4 rounded-xl bg-red-50 border border-red-200 text-sm text-red-600 font-medium">
+            ❌ {jobStatus.error || jobStatus.message}
+          </div>
+        )}
+
+        {/* RESULT */}
         {result && (
           <div className="mt-10 pt-8 border-t border-gray-100">
-            <h2 className="text-base font-extrabold text-gray-800 mb-4 flex items-center gap-2 tracking-tight">
+            <h2 className="text-base font-extrabold text-gray-800 mb-4 flex items-center gap-2">
               <span>📊</span> Hasil Analisis Sheet [{sheetToAnalyze}]
             </h2>
             <div className="text-gray-800 w-full overflow-hidden">
