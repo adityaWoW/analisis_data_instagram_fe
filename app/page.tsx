@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
 import FileSelector from "@/components/FileSelector";
-import ResultCard from "@/components/ResultCard";
 import API from "@/service/api";
+import API2 from "@/service/api2";
+import IGWorkerPanel from "@/components/IGWorkerPanel";
 
 interface FileItem {
   id: string;
@@ -17,102 +18,40 @@ interface ApiResponse<T> {
   data: T;
 }
 
-interface JobStatus {
-  job_id: string;
-  status: "running" | "done" | "error";
-  progress: number;
-  total: number;
-  done: number;
-  batch_done: number;
-  batch_total: number;
-  message: string;
-  result: Record<string, unknown> | null;
-  error: string | null;
-}
-
 export default function HomePage() {
+  // ─── NAVBAR STATE ──────────────────────────────────────────
+  const [activeTab, setActiveTab] = useState<"proses" | "monitoring">("proses");
+
   const [files, setFiles] = useState<FileItem[]>([]);
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
   const [folderStack, setFolderStack] = useState<
     { id: string; name: string }[]
   >([]);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [availableSheets, setAvailableSheets] = useState<string[]>([]);
   const [sheetToAnalyze, setSheetToAnalyze] = useState<string>("");
   const [loadingSheets, setLoadingSheets] = useState(false);
-
-  // ─── JOB STATE ────────────────────────────────────────────
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
-  const pollRef = useRef<NodeJS.Timeout | null>(null);
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  // Polling status job tiap 5 detik
-  const startPolling = useCallback(
-    (id: string) => {
-      stopPolling();
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await API.get<JobStatus>(`/analyze/status/${id}`);
-          const status = res.data;
-          setJobStatus(status);
-
-          if (status.status === "done") {
-            stopPolling();
-            setAnalyzing(false);
-            setResult(status.result);
-          } else if (status.status === "error") {
-            stopPolling();
-            setAnalyzing(false);
-            alert(`Analisis gagal: ${status.error || status.message}`);
-          }
-        } catch (err) {
-          console.error("Polling error:", err);
-        }
-      }, 5000);
-    },
-    [stopPolling],
-  );
-
-  // Cleanup polling saat unmount
-  useEffect(() => () => stopPolling(), [stopPolling]);
 
   const resetFileSelection = useCallback(() => {
     setSelectedFile(null);
     setAvailableSheets([]);
     setSheetToAnalyze("");
-    setResult(null);
-    setJobId(null);
-    setJobStatus(null);
-    stopPolling();
-  }, [stopPolling]);
+  }, []);
 
   const fetchRootFiles = useCallback(async () => {
     try {
-      setLoading(true);
       const res = await API.get<ApiResponse<FileItem[]>>("/files");
       setFiles(res.data?.data || []);
       resetFileSelection();
       setFolderStack([]);
     } catch {
       alert("Gagal mengambil file utama 😢");
-    } finally {
-      setLoading(false);
     }
   }, [resetFileSelection]);
 
   const openFolder = useCallback(
     async (folder: FileItem) => {
       try {
-        setLoading(true);
         const res = await API.get<ApiResponse<FileItem[]>>(
           `/files/${folder.id}`,
         );
@@ -124,8 +63,6 @@ export default function HomePage() {
         resetFileSelection();
       } catch {
         alert("Gagal membuka folder 😢");
-      } finally {
-        setLoading(false);
       }
     },
     [resetFileSelection],
@@ -166,9 +103,6 @@ export default function HomePage() {
     }
 
     setSelectedFile(selected);
-    setResult(null);
-    setJobId(null);
-    setJobStatus(null);
 
     const isSheet =
       selected.type === "sheet" ||
@@ -199,7 +133,6 @@ export default function HomePage() {
 
   const goBack = useCallback(async () => {
     try {
-      setLoading(true);
       const updatedStack = [...folderStack];
       updatedStack.pop();
       resetFileSelection();
@@ -217,12 +150,9 @@ export default function HomePage() {
       setFolderStack(updatedStack);
     } catch {
       alert("Gagal kembali ke folder sebelumnya 💔");
-    } finally {
-      setLoading(false);
     }
   }, [folderStack, resetFileSelection]);
 
-  // ─── ANALYZE — kirim job, lalu polling ────────────────────
   const analyzeFile = async () => {
     if (!selectedFile) {
       alert("Pilih file terlebih dahulu ✨");
@@ -235,39 +165,25 @@ export default function HomePage() {
 
     try {
       setAnalyzing(true);
-      setResult(null);
-      setJobStatus(null);
-
-      const res = await API.post<{ success: boolean; job_id: string }>(
-        "/analyze",
-        {
-          file_id: selectedFile.id,
-          sheet_name: sheetToAnalyze,
-        },
-      );
-
-      const id = res.data?.job_id;
-      if (!id) throw new Error("job_id tidak diterima dari server");
-
-      setJobId(id);
-      setJobStatus({
-        job_id: id,
-        status: "running",
-        progress: 0,
-        total: 0,
-        done: 0,
-        batch_done: 0,
-        batch_total: 0,
-        message: "Job dimulai...",
-        result: null,
-        error: null,
+      await API2.post("/spreadSheet", {
+        spreadsheet_id: selectedFile.id,
+        sheet_name: sheetToAnalyze,
       });
 
-      startPolling(id);
+      alert("Analisis berhasil dikirim! 🚀");
+      setActiveTab("monitoring");
     } catch (err) {
       console.error(err);
+
+      const errorWithResponse = err as {
+        response?: { data?: { detail?: string } };
+      };
+
+      const errorMessage =
+        errorWithResponse.response?.data?.detail || "Gagal memulai analisis 😢";
+      alert(errorMessage);
+    } finally {
       setAnalyzing(false);
-      alert("Gagal memulai analisis 😢");
     }
   };
 
@@ -287,180 +203,220 @@ export default function HomePage() {
     };
   }, [fetchRootFiles]);
 
-  const isRunning = analyzing || jobStatus?.status === "running";
-
   return (
     <main className="min-h-screen bg-[#FDF8F5] p-6 md:p-12 flex items-start justify-center font-sans">
       <div className="w-full max-w-4xl bg-white rounded-2xl shadow-md shadow-rose-100/40 p-6 md:p-10 border border-rose-100/60 transition-all">
         {/* HEADER */}
-        <div className="text-center mb-8">
+        <div className="text-center mb-6">
           <span className="text-4xl inline-block mb-2">✨</span>
           <h1 className="text-3xl font-extrabold text-gray-800 tracking-tight md:text-4xl">
             Google Drive File Analyzer
           </h1>
-          <p className="text-base text-gray-500 mt-2 font-medium">
-            Pilih file, lalu tentukan sheet yang ingin dianalisis.
-          </p>
         </div>
 
-        {/* BREADCRUMB */}
-        {folderStack.length > 0 && (
-          <div className="flex flex-wrap gap-2 text-sm text-gray-500 mb-4 items-center">
+        {/* SUB NAVBAR MODERN PILL DESIGN */}
+        <div className="flex justify-center mb-10">
+          <div className="flex flex-row gap-16 px-8 py-3 bg-transparent justify-center items-center w-full max-w-md mx-auto">
+            {/* TAB 1: PROSES DATA */}
             <button
-              onClick={fetchRootFiles}
-              className="hover:text-rose-500 font-medium transition-colors"
+              onClick={() => setActiveTab("proses")}
+              className="flex items-center gap-2.5 py-2 px-4 focus:outline-none group transition-all duration-300 rounded-lg"
             >
-              🏠 Utama
-            </button>
-            {folderStack.map((folder) => (
-              <span key={folder.id} className="text-gray-400">
-                /{" "}
-                <span className="text-gray-600 font-medium">{folder.name}</span>
+              <svg
+                className={`w-4 h-4 transition-all duration-300 ${
+                  activeTab === "proses"
+                    ? "rotate-45 text-rose-500 scale-110"
+                    : "text-gray-400 group-hover:text-gray-600"
+                }`}
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                />
+              </svg>
+              <span
+                className={`text-sm font-semibold tracking-wide transition-colors duration-300 ${
+                  activeTab === "proses"
+                    ? "text-rose-500"
+                    : "text-gray-400 group-hover:text-gray-700"
+                }`}
+              >
+                Proses Data
               </span>
-            ))}
-          </div>
-        )}
+            </button>
 
-        {/* FILE SELECTOR */}
-        <div className="space-y-3">
-          <label className="block text-xs font-bold uppercase tracking-wider text-rose-500">
-            Pilih File / Folder
-          </label>
-          <div className="p-1.5 bg-gray-50 rounded-xl border border-gray-200">
-            <FileSelector
-              files={files}
-              selected={selectedFile?.id || ""}
-              onChange={handleSelectFile}
-            />
+            {/* TAB 2: MONITORING JOB */}
+            <button
+              onClick={() => setActiveTab("monitoring")}
+              className="flex items-center gap-2.5 py-2 px-4 focus:outline-none group transition-all duration-300 rounded-lg"
+            >
+              <svg
+                className={`w-4 h-4 transition-all duration-300 ${
+                  activeTab === "monitoring"
+                    ? "text-rose-500 scale-110"
+                    : "text-gray-400 group-hover:text-gray-600"
+                }`}
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 002 2h2a2 2 0 002-2z"
+                />
+              </svg>
+              <span
+                className={`text-sm font-semibold tracking-wide transition-colors duration-300 ${
+                  activeTab === "monitoring"
+                    ? "text-rose-500"
+                    : "text-gray-400 group-hover:text-gray-700"
+                }`}
+              >
+                Monitoring Job
+              </span>
+
+              {analyzing && (
+                <span className="flex h-1.5 w-1.5 relative shrink-0">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-rose-500"></span>
+                </span>
+              )}
+            </button>
           </div>
         </div>
 
-        {folderStack.length > 0 && (
-          <button
-            onClick={goBack}
-            className="mt-3 text-sm text-rose-500 hover:text-rose-600 transition-colors"
-          >
-            ← Kembali Folder
-          </button>
-        )}
+        {/* TAB CONTENT: PROSES DATA */}
+        {activeTab === "proses" && (
+          <div className="space-y-6 animate-fadeIn">
+            {/* BREADCRUMB */}
+            {folderStack.length > 0 && (
+              <div className="flex flex-wrap gap-2 text-sm text-gray-500 mb-4 items-center">
+                <button
+                  onClick={fetchRootFiles}
+                  className="hover:text-rose-500 font-medium transition-colors"
+                >
+                  🏠 Utama
+                </button>
+                {folderStack.map((folder) => (
+                  <span key={folder.id} className="text-gray-400">
+                    /{" "}
+                    <span className="text-gray-600 font-medium">
+                      {folder.name}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            )}
 
-        {/* SHEET SELECTOR */}
-        {selectedFile && (
-          <div className="mt-6 p-5 rounded-xl bg-rose-50/50 border border-rose-100 space-y-4">
-            <div>
-              <p className="text-xs text-gray-400 uppercase font-bold tracking-wider">
-                File Induk:
-              </p>
-              <p className="text-lg font-bold text-gray-800 mt-0.5">
-                📄 {selectedFile.name}
-              </p>
+            {/* FILE SELECTOR */}
+            <div className="space-y-3">
+              <label className="block text-xs font-bold uppercase tracking-wider text-rose-500">
+                Pilih File / Folder
+              </label>
+              <div className="p-1.5 bg-gray-50 rounded-xl border border-gray-200">
+                <FileSelector
+                  files={files}
+                  selected={selectedFile?.id || ""}
+                  onChange={handleSelectFile}
+                />
+              </div>
             </div>
 
-            {loadingSheets ? (
-              <div className="pt-2 border-t border-rose-200/60 flex items-center gap-2 text-sm text-rose-500 font-medium animate-pulse">
-                ⏳ Sedang memuat sheet...
-              </div>
-            ) : (
-              availableSheets.length > 0 && (
-                <div className="pt-4 border-t border-rose-200/60 space-y-3">
-                  <label className="block text-xs font-bold uppercase tracking-wider text-gray-600">
-                    Pilih Sheet 👇
-                  </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-60 overflow-y-auto pr-1">
-                    {availableSheets.map((sheetName) => {
-                      const isSelected = sheetToAnalyze === sheetName;
-                      return (
-                        <button
-                          key={sheetName}
-                          onClick={() => setSheetToAnalyze(sheetName)}
-                          className={`w-full text-left px-4 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-between border ${
-                            isSelected
-                              ? "bg-rose-500 text-white border-rose-500 shadow-md scale-[1.01]"
-                              : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
-                          }`}
-                        >
-                          <span className="truncate">📊 {sheetName}</span>
-                          {isSelected && (
-                            <span className="text-xs bg-white text-rose-500 px-2.5 py-1 rounded-full font-bold">
-                              Terpilih
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
+            {folderStack.length > 0 && (
+              <button
+                onClick={goBack}
+                className="mt-3 text-sm text-rose-500 hover:text-rose-600 transition-colors"
+              >
+                ← Kembali Folder
+              </button>
+            )}
+
+            {/* SHEET SELECTOR */}
+            {selectedFile && (
+              <div className="mt-6 p-5 rounded-xl bg-rose-50/50 border border-rose-100 space-y-4">
+                <div>
+                  <p className="text-xs text-gray-400 uppercase font-bold tracking-wider">
+                    File Induk:
+                  </p>
+                  <p className="text-lg font-bold text-gray-800 mt-0.5">
+                    📄 {selectedFile.name}
+                  </p>
                 </div>
-              )
-            )}
-          </div>
-        )}
 
-        {/* ANALYZE BUTTON */}
-        <button
-          onClick={analyzeFile}
-          disabled={
-            isRunning ||
-            loadingSheets ||
-            !selectedFile ||
-            (availableSheets.length > 0 && !sheetToAnalyze)
-          }
-          className="w-full mt-6 bg-rose-500 hover:bg-rose-600 text-white font-bold py-4 px-6 rounded-xl text-base transition-all disabled:opacity-50 disabled:pointer-events-none shadow-md flex items-center justify-center gap-2"
-        >
-          {isRunning
-            ? "⏳ Sedang Menganalisis..."
-            : `Analyze Sheet: ${sheetToAnalyze || selectedFile?.name || ""} 🚀`}
-        </button>
-
-        {/* PROGRESS BAR */}
-        {jobStatus && jobStatus.status === "running" && (
-          <div className="mt-6 p-5 rounded-xl bg-blue-50 border border-blue-100 space-y-3">
-            <div className="flex items-center justify-between text-sm font-semibold text-blue-700">
-              <span>🔄 {jobStatus.message}</span>
-              <span>{jobStatus.progress}%</span>
-            </div>
-
-            {/* Progress bar */}
-            <div className="w-full bg-blue-100 rounded-full h-3 overflow-hidden">
-              <div
-                className="bg-blue-500 h-3 rounded-full transition-all duration-500"
-                style={{ width: `${jobStatus.progress}%` }}
-              />
-            </div>
-
-            {/* Detail batch */}
-            {jobStatus.batch_total > 0 && (
-              <div className="flex justify-between text-xs text-blue-500 font-medium">
-                <span>
-                  Batch {jobStatus.batch_done}/{jobStatus.batch_total}
-                </span>
-                <span>
-                  {jobStatus.done}/{jobStatus.total} URL selesai
-                </span>
+                {loadingSheets ? (
+                  <div className="pt-2 border-t border-rose-200/60 flex items-center gap-2 text-sm text-rose-500 font-medium animate-pulse">
+                    ⏳ Sedang memuat sheet...
+                  </div>
+                ) : (
+                  availableSheets.length > 0 && (
+                    <div className="pt-4 border-t border-rose-200/60 space-y-3">
+                      <label className="block text-xs font-bold uppercase tracking-wider text-gray-600">
+                        Pilih Sheet 👇
+                      </label>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-60 overflow-y-auto pr-1">
+                        {availableSheets.map((sheetName) => {
+                          const isSelected = sheetToAnalyze === sheetName;
+                          return (
+                            <button
+                              key={sheetName}
+                              onClick={() => setSheetToAnalyze(sheetName)}
+                              className={`w-full text-left px-4 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-between border ${
+                                isSelected
+                                  ? "bg-rose-500 text-white border-rose-500 shadow-md scale-[1.01]"
+                                  : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
+                              }`}
+                            >
+                              <span className="truncate">📊 {sheetName}</span>
+                              {isSelected && (
+                                <span className="text-xs bg-white text-rose-500 px-2.5 py-1 rounded-full font-bold">
+                                  Terpilih
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )
+                )}
               </div>
             )}
 
-            <p className="text-xs text-blue-400 text-center">
-              Polling otomatis tiap 5 detik · Jangan tutup halaman ini
-            </p>
+            {/* ANALYZE BUTTON */}
+            <button
+              onClick={analyzeFile}
+              disabled={
+                analyzing ||
+                loadingSheets ||
+                !selectedFile ||
+                (availableSheets.length > 0 && !sheetToAnalyze)
+              }
+              className="w-full mt-6 bg-rose-500 hover:bg-rose-600 text-white font-bold py-4 px-6 rounded-xl text-base transition-all disabled:opacity-50 disabled:pointer-events-none shadow-md flex items-center justify-center gap-2"
+            >
+              {analyzing
+                ? "⏳ Sedang Menganalisis..."
+                : `Analyze Sheet: ${sheetToAnalyze || selectedFile?.name || ""} 🚀`}
+            </button>
           </div>
         )}
 
-        {/* ERROR STATE */}
-        {jobStatus?.status === "error" && (
-          <div className="mt-6 p-4 rounded-xl bg-red-50 border border-red-200 text-sm text-red-600 font-medium">
-            ❌ {jobStatus.error || jobStatus.message}
-          </div>
-        )}
-
-        {/* RESULT */}
-        {result && (
-          <div className="mt-10 pt-8 border-t border-gray-100">
-            <h2 className="text-base font-extrabold text-gray-800 mb-4 flex items-center gap-2">
-              <span>📊</span> Hasil Analisis Sheet [{sheetToAnalyze}]
-            </h2>
-            <div className="text-gray-800 w-full overflow-hidden">
-              <ResultCard result={result} />
-            </div>
+        {/* ─── TAB CONTENT: MONITORING JOB ─── */}
+        {activeTab === "monitoring" && (
+          <div className="animate-fadeIn">
+            <IGWorkerPanel />
           </div>
         )}
       </div>
