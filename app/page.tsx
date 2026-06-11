@@ -180,7 +180,7 @@ export default function HomePage() {
       };
 
       const errorMessage =
-        errorWithResponse.response?.data?.detail || "Gagal memulai analisis 😢";
+        errorWithResponse.response?.data?.detail || "Gagal Proses Analisi 😢";
       alert(errorMessage);
     } finally {
       setAnalyzing(false);
